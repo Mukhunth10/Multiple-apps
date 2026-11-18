@@ -1,0 +1,172 @@
+name: Build Snap Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.11.0)'
+        required: true
+        default: 'v1.11.0'
+
+jobs:
+  build-snap:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      # Zonder expliciete `ref:` checkt workflow_dispatch altijd de default
+      # branch uit, niet de opgegeven versie-tag — dat bouwde tot nu toe
+      # stilzwijgend de hoofdbranch i.p.v. de gevraagde historische release.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref }}
+
+      - name: Get version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1' # 1.100 breaks tauri-build 2.6.2 (build-dir layout)
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf pkg-config
+
+      - name: Install frontend dependencies
+        working-directory: open-pdf-studio
+        run: npm install
+
+      # Tauri requires binaries/pdfium-worker-<target-triple> to exist. Build
+      # and place it first, as the release workflow does, so this build does
+      # not depend on the build script finding the worker in the target dir.
+      - name: Build pdfium-worker sidecar
+        run: |
+          cargo build --release -p pdfium-worker
+          mkdir -p open-pdf-studio/src-tauri/binaries
+          cp target/release/pdfium-worker open-pdf-studio/src-tauri/binaries/pdfium-worker-x86_64-unknown-linux-gnu
+
+      - name: Build Tauri app
+        working-directory: open-pdf-studio
+        run: npx tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'tauri2026'
+
+      - name: Prepare snap build
+        run: |
+          # Find the built deb
+          # De Tauri-bundle landt op $GITHUB_WORKSPACE/target/... (repo-ROOT,
+          # ondanks dat de build zelf met working-directory: open-pdf-studio
+          # draait — een gedeelde Cargo target-dir voor de hele monorepo).
+          # Eerdere paden (met src-tauri/ of een open-pdf-studio/-prefix erbij)
+          # vonden de deb dus nooit, ongeacht credentials (root cause van de
+          # vastgelopen Snap Store-versie).
+          DEB_FILE=$(find target/release/bundle/deb -name "*.deb" | head -1)
+          echo "Found deb: $DEB_FILE"
+
+          # Copy deb to repo root for snapcraft
+          cp "$DEB_FILE" open-pdf-studio.deb
+
+          # Update version in snapcraft.yaml
+          sed -i "s/^version: .*/version: '${{ steps.get-version.outputs.version_number }}'/" snap/snapcraft.yaml
+
+      - name: Install Snapcraft
+        run: sudo snap install snapcraft --classic
+
+      - name: Build snap
+        id: snapcraft
+        run: |
+          # Use destructive mode so snapcraft builds directly on the runner
+          # instead of spinning up an LXD container. The default LXD provider
+          # fails on GitHub Actions runners because the runner user isn't in
+          # the `lxd` group and snapcraft can't add it on the fly. Destructive
+          # mode is the standard pattern for ephemeral CI environments.
+          # `snapcraft pack` replaces the bare `snapcraft` invocation which
+          # is deprecated in snapcraft 8+.
+          sudo snapcraft pack --destructive-mode
+          SNAP_FILE=$(ls *.snap | head -1)
+          echo "snap=$SNAP_FILE" >> $GITHUB_OUTPUT
+          echo "Built snap: $SNAP_FILE"
+
+      - name: Upload snap to GitHub release
+        run: |
+          SNAP_FILE="${{ steps.snapcraft.outputs.snap }}"
+          echo "Uploading $SNAP_FILE to release ${{ steps.get-version.outputs.version }}"
+
+          # Wait for the release to be created by the main release workflow
+          for i in $(seq 1 30); do
+            if gh release view "${{ steps.get-version.outputs.version }}" > /dev/null 2>&1; then
+              echo "Release found"
+              break
+            fi
+            echo "Waiting for release... (attempt $i/30)"
+            sleep 30
+          done
+
+          gh release upload "${{ steps.get-version.outputs.version }}" "$SNAP_FILE" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # OpenPGP signatures (#842). The sign-linux job of release.yml signs this
+      # snap together with the .deb and the AppImage. When that job has already
+      # signed the Linux assets before this snap arrived (SHA256SUMS is on the
+      # release), or for a manual rebuild of an existing release, the .snap.asc
+      # would not match the new snap, so sign the Linux assets again here. The
+      # script and the public key come from the default branch, because an
+      # older tag that is rebuilt does not have them.
+      - name: Check out the signing script
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-signing
+          sparse-checkout: |
+            open-pdf-studio/scripts/sign-linux-release.sh
+            docs/keys/openaec-signing-public-key.asc
+          sparse-checkout-cone-mode: false
+
+      - name: Sign the Linux assets again (OpenPGP)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.get-version.outputs.version }}
+          OPENAEC_GPG_PRIVATE_KEY: ${{ secrets.OPENAEC_GPG_PRIVATE_KEY }}
+          OPENAEC_GPG_PASSPHRASE: ${{ secrets.OPENAEC_GPG_PASSPHRASE }}
+          OPENAEC_GPG_FINGERPRINT: ${{ vars.OPENAEC_GPG_FINGERPRINT }}
+          OPENAEC_GPG_EXPECTED_FINGERPRINT: 13F6D414ADEE4ED4CD09AC60601D86C93C504D29
+        run: |
+          set -euo pipefail
+          names=$(gh release view "$VERSION" --json assets -q '.assets[].name')
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && ! grep -qx 'SHA256SUMS' <<< "$names"; then
+            echo "The sign-linux job of release.yml signs this snap."
+            exit 0
+          fi
+          bash release-signing/open-pdf-studio/scripts/sign-linux-release.sh release "$VERSION" \
+            release-signing/docs/keys/openaec-signing-public-key.asc
+
+      - name: Publish to Snap Store
+        if: env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        run: |
+          SNAP_FILE="${{ steps.snapcraft.outputs.snap }}"
+          snapcraft upload "$SNAP_FILE" --release=stable
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}

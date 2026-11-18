@@ -1,0 +1,549 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags-ignore:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'ubuntu-22.04'
+          - platform: 'windows-latest'
+          - platform: 'macos-26'
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      # Do not bundle the display stack into the AppImage. Bundled Ubuntu-era
+      # libwayland/xkbcommon/xcb shadow the host copies and abort WebKit with
+      # "Could not create default EGL display: EGL_BAD_PARAMETER" on newer Mesa
+      # (Fedora 44, issue #362). linuxdeploy reads this list; the host provides
+      # these libraries. Keep in sync with scripts/linux-appimage-smoke.sh.
+      LINUXDEPLOY_EXCLUDED_LIBRARIES: 'libwayland-client.so*;libwayland-cursor.so*;libwayland-egl.so*;libwayland-server.so*;libxkbcommon.so*;libxcb-randr.so*;libxcb-render.so*;libxcb-shm.so*;libXau.so*;libXdmcp.so*'
+    defaults:
+      run:
+        working-directory: open-pdf-studio
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1' # 1.100 breaks tauri-build 2.6.2 (build-dir layout)
+
+      - name: Install Rust targets (macOS universal)
+        if: matrix.platform == 'macos-26'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf pkg-config
+
+      # tesseract-rs compiles Leptonica/Tesseract from source and links them
+      # statically (#620). It keeps the sources and static libs in
+      # ~/.tesseract-rs, so cache that; the key follows the tesseract-rs pin
+      # in the workspace Cargo.toml.
+      - name: Cache Tesseract static build (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/cache@v5
+        with:
+          path: ~/.tesseract-rs
+          key: tesseract-rs-ubuntu-22.04-${{ hashFiles('Cargo.toml') }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run quality regression tests
+        run: npm run test:quality
+
+      - name: Prepare native runtime
+        run: npm run prepare:native-runtime
+
+      # The OCR save tests run the real fontkit path with the bundled font, which
+      # is not in git. The build step fetches it later anyway.
+      - name: Prepare OCR runtime
+        run: npm run prepare:ocr-runtime
+
+      - name: Provision Unicode test fonts
+        env:
+          OPS_UNICODE_FONT_DIR: ${{ runner.temp }}/ops-unicode-fonts
+        run: node scripts/prepare-unicode-fonts.mjs
+
+      - name: Run unit tests
+        env:
+          OPS_UNICODE_FONT_DIR: ${{ runner.temp }}/ops-unicode-fonts
+        run: npm run test:unit
+
+      # The hosted web bundle follows the workplace protocol of the OpenAEC
+      # SuperCloud (#694, #704). Build it unchanged, serve it from a sub-path
+      # under the host's strict CSP, load it in an opaque-origin sandboxed
+      # iframe (credentialless) from a test page on another origin and drive
+      # it in headless Chromium: open from bytes, save an annotation back
+      # (including a conflict), list files and versions, and ignore messages
+      # from any other origin or window.
+      - name: Test the hosted bridge (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:hosted-bridge
+
+      - name: Test pdf-lib XRef rejection and save recovery (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/pdf-lib-xref-browser.mjs
+
+      - name: Test textbox colour and defaults (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-text-color-browser.mjs
+
+      - name: Test high-contrast palette and feedback (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-high-contrast-browser.mjs
+
+      - name: Test MCP closed perimeter and PDF save (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-mcp-perimeter-browser.mjs
+
+      - name: Test Space pan and Ctrl-wheel zoom (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-space-pan-browser.mjs
+
+      - name: Test startup tool preference (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-startup-tool-browser.mjs
+
+      - name: Test presentation view (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-presentation-browser.mjs
+
+      - name: Test tab switch across view modes (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-tab-view-mode-browser.mjs
+
+      - name: Text highlight blending regression
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-highlight-blending-browser.mjs
+
+      - name: Test deleted comment popup lifecycle (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-comment-popup-browser.mjs
+
+      - name: Test compact save and print controls (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-save-print-ui-browser.mjs
+
+      - name: Test reverse font substitutions and save roundtrip (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: node scripts/test-fontkit-reverse-browser.mjs
+
+      - name: Test Windows user updater configuration
+        run: node --test scripts/windows-user-update.test.mjs
+
+      - name: Run Linux release regression tests
+        run: node --test scripts/linux-release-config.test.mjs
+
+      - name: Test AppImage smoke checks
+        if: matrix.platform == 'ubuntu-22.04'
+        run: bash scripts/linux-appimage-smoke.test.sh
+
+      - name: Test OpenAEC Linux smoke checks
+        if: matrix.platform == 'ubuntu-22.04'
+        run: bash scripts/openaec-linux-smoke.test.sh
+
+      # The PDFium worker pool runs as a Tauri sidecar (bundle.externalBin).
+      # Tauri requires binaries/pdfium-worker-<target-triple> to exist at
+      # build time on EVERY desktop platform, so build the workspace crate
+      # first and drop it in with the right triple suffix (same steps as
+      # release.yml — without this every CI build fails on a missing
+      # resource path).
+      - name: Build pdfium-worker sidecar (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: .
+        run: |
+          cargo build --release -p pdfium-worker
+          New-Item -ItemType Directory -Force open-pdf-studio/src-tauri/binaries | Out-Null
+          Copy-Item target/release/pdfium-worker.exe open-pdf-studio/src-tauri/binaries/pdfium-worker-x86_64-pc-windows-msvc.exe -Force
+
+      - name: Build pdfium-worker sidecar (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: .
+        run: |
+          cargo build --release -p pdfium-worker
+          mkdir -p open-pdf-studio/src-tauri/binaries
+          cp target/release/pdfium-worker open-pdf-studio/src-tauri/binaries/pdfium-worker-x86_64-unknown-linux-gnu
+
+      - name: Build pdfium-worker sidecar (macOS universal)
+        if: matrix.platform == 'macos-26'
+        working-directory: .
+        run: |
+          cargo build --release -p pdfium-worker --target aarch64-apple-darwin
+          cargo build --release -p pdfium-worker --target x86_64-apple-darwin
+          mkdir -p open-pdf-studio/src-tauri/binaries
+          # tauri-build validates the sidecar PER ARCH during the per-target
+          # cargo builds of a universal bundle, so all three names must exist.
+          cp target/aarch64-apple-darwin/release/pdfium-worker open-pdf-studio/src-tauri/binaries/pdfium-worker-aarch64-apple-darwin
+          cp target/x86_64-apple-darwin/release/pdfium-worker open-pdf-studio/src-tauri/binaries/pdfium-worker-x86_64-apple-darwin
+          lipo -create -output open-pdf-studio/src-tauri/binaries/pdfium-worker-universal-apple-darwin \
+            target/aarch64-apple-darwin/release/pdfium-worker \
+            target/x86_64-apple-darwin/release/pdfium-worker
+
+      - name: Fetch libpdfium.so (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          mkdir -p src-tauri/binaries/linux-x64
+          curl -L "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8076/pdfium-linux-x64.tgz" -o /tmp/pdfium-linux.tgz
+          # Checksum and revision: src-tauri/binaries/pdfium-runtime.json (#635).
+          echo "d9d67bc40af03aef4fe28a60b19b1086f28ace019c8c9caf19cb7fe3d14ceca3  /tmp/pdfium-linux.tgz" | sha256sum -c -
+          tar xzf /tmp/pdfium-linux.tgz -C /tmp lib/libpdfium.so
+          cp /tmp/lib/libpdfium.so src-tauri/binaries/linux-x64/libpdfium.so
+
+      - name: Build Tauri app
+        if: matrix.platform == 'windows-latest'
+        run: npm run tauri build -- --no-bundle
+
+      - name: Test Windows duplex buffer handling (no print jobs)
+        if: matrix.platform == 'windows-latest'
+        working-directory: .
+        run: cargo test --locked --manifest-path open-pdf-studio/scripts/print-native-tests/Cargo.toml print_devmode::tests::duplex_keeps_paper_orientation_copies_and_driver_data -- --exact
+
+      # Tauri 2.10 downloads its own, older linuxdeploy build, which ignores
+      # LINUXDEPLOY_EXCLUDED_LIBRARIES, so the display stack ended up in the
+      # AppImage anyway (issue #362). Tauri only downloads when the file is not
+      # already in its tool cache (~/.cache/tauri), so place a pinned,
+      # checksum-verified linuxdeploy release there first.
+      - name: Provide pinned linuxdeploy (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$tools"
+          curl -fsSL --retry 3 -o "$tools/linuxdeploy-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  $tools/linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          chmod +x "$tools/linuxdeploy-x86_64.AppImage"
+
+      - name: Build Tauri AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        run: npm run tauri build -- --bundles appimage --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # The binary must not need a distro-specific libtesseract/liblept soname:
+      # the .deb, the AppImage and repackagers such as the AUR use it as is (#620).
+      - name: Test duplex IPP and portal settings (no print jobs)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: .
+        run: cargo test --release -p open-pdf-studio --lib duplex_reaches_ipp_and_portal_settings
+
+      - name: Test HTTP MCP notification responses (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: .
+        run: cargo test --release --locked -p open-pdf-studio --lib mcp_server::http_notification_tests
+
+      - name: Test MCP capture content and path diagnostics (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: .
+        run: cargo test --release -p open-pdf-studio --lib mcp_server::capture_result::tests
+
+      - name: Test interactive form background ownership (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: .
+        run: |
+          cargo test --release -p pdfium-worker render::tests -- --test-threads=1
+          cargo test --release -p open-pdf-studio --lib form_display_tests -- --test-threads=1
+
+      - name: Verify no system OCR library dependency (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: bash scripts/linux-ocr-linkage-check.sh ../target/release/open-pdf-studio
+
+      - name: Verify AppImage on Debian 13
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          appimage=$(find ../target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          appimage=$(realpath "$appimage")
+          docker run --rm \
+            -v "$appimage:/input/open-pdf-studio.AppImage:ro" \
+            -v "$PWD/scripts/linux-appimage-smoke.sh:/input/linux-appimage-smoke.sh:ro" \
+            debian:13-slim \
+            bash -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dbus-x11 gvfs libegl1 libgles2 libgtk-3-0t64 xauth xvfb && cp /input/open-pdf-studio.AppImage /tmp/open-pdf-studio.AppImage && bash /input/linux-appimage-smoke.sh /tmp/open-pdf-studio.AppImage 10'
+
+      # Fedora 44 ships Mesa 26, where an AppImage that bundles its own display
+      # stack aborts before a window appears (issue #362). Start the same
+      # AppImage against Fedora's own libraries. The container installs every
+      # display-stack library the AppImage no longer bundles; a desktop Fedora
+      # has them through Mesa and GTK.
+      - name: Verify AppImage on Fedora 44
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          appimage=$(find ../target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          appimage=$(realpath "$appimage")
+          docker run --rm \
+            -v "$appimage:/input/open-pdf-studio.AppImage:ro" \
+            -v "$PWD/scripts/linux-appimage-smoke.sh:/input/linux-appimage-smoke.sh:ro" \
+            fedora:44 \
+            bash -lc 'dnf install -y --setopt=install_weak_deps=False dbus-daemon dbus-tools findutils gtk3 gvfs libwayland-client libwayland-cursor libwayland-egl libwayland-server libxcb libXau libXdmcp libxkbcommon mesa-libEGL libglvnd-gles xorg-x11-server-Xvfb xorg-x11-xauth && cp /input/open-pdf-studio.AppImage /tmp/open-pdf-studio.AppImage && bash /input/linux-appimage-smoke.sh /tmp/open-pdf-studio.AppImage 10'
+
+      # OpenAEC Linux (#863): the SuperCloud runs the EXTRACTED AppImage in a
+      # container without FUSE or GPU, under labwc (Wayland), without a session
+      # bus, keyring, system tray or notification daemon. Same here: Debian 13,
+      # labwc on the wlroots headless backend with the pixman renderer and Mesa
+      # llvmpipe, no /dev/dri. The script starts the app twice (without and
+      # with a relative file argument), takes a screenshot, measures the memory
+      # at rest and checks a clean SIGTERM shutdown (docs/openaec-linux.md).
+      - name: Verify AppImage in OpenAEC Linux conditions (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          appimage=$(find ../target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          appimage=$(realpath "$appimage")
+          mkdir -p "$RUNNER_TEMP/openaec-linux"
+          docker run --rm \
+            -v "$appimage:/input/open-pdf-studio.AppImage:ro" \
+            -v "$PWD/scripts/openaec-linux-smoke.sh:/input/openaec-linux-smoke.sh:ro" \
+            -v "$RUNNER_TEMP/openaec-linux:/output" \
+            debian:13-slim \
+            bash -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends labwc grim libgtk-3-0t64 libegl1 libgl1 libgles2 libgbm1 libgl1-mesa-dri fonts-dejavu-core && cp /input/open-pdf-studio.AppImage /tmp/open-pdf-studio.AppImage && bash /input/openaec-linux-smoke.sh /tmp/open-pdf-studio.AppImage 15 /output'
+
+      - name: Upload OpenAEC Linux screenshots (Linux)
+        if: always() && matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openaec-linux-smoke
+          path: ${{ runner.temp }}/openaec-linux
+          if-no-files-found: ignore
+
+      - name: Build ad-hoc signed macOS app
+        if: matrix.platform == 'macos-26'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: npm run tauri build -- --target universal-apple-darwin --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify and launch macOS app
+        if: matrix.platform == 'macos-26'
+        run: |
+          APP_PATH="../target/universal-apple-darwin/release/bundle/macos/Open PDF Studio.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          # Homebrew is on the runner, so the startup smoke would pass even
+          # if the app needs one of its dylibs; check the load commands (#750).
+          bash scripts/macos-dylib-check.sh "$APP_PATH"
+          bash scripts/macos-startup-smoke.sh "$APP_PATH"
+
+  # De gehoste bundel onder de strikte CSP van #693 en onder die van de
+  # werkplek (#704: opaque sandbox, geen 'self', subpad): openen, tekenen,
+  # annoteren en opslaan in headless Chromium, met nul overtredingen. Los van
+  # de desktop-builds; lokaal: npm run test:hosted-csp.
+  flatpak-lint:
+    # Flathub readiness (#389): validates the desktop file and the metainfo and
+    # lints the manifest as it would be submitted (flatpak-builder-lint). Runs
+    # only when the Flatpak changes or the lockfiles its offline sources are
+    # generated from (flatpak/**, Cargo.lock, package-lock.json).
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect Flatpak changes
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            changed=true
+          elif git diff --name-only "$base" HEAD \
+              | grep -qE '^(flatpak/|Cargo\.lock$|open-pdf-studio/package-lock\.json$|open-pdf-studio/scripts/flatpak-flathub\.test\.mjs$|\.github/workflows/ci\.yml$)'; then
+            changed=true
+          else
+            changed=false
+          fi
+          echo "flatpak=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.changes.outputs.flatpak == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Flatpak tooling
+        if: steps.changes.outputs.flatpak == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak appstream desktop-file-utils
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          # flatpak-builder, flathub-build and flatpak-builder-lint, the same
+          # tools the Flathub builders use.
+          flatpak install --user -y --noninteractive flathub org.flatpak.Builder
+
+      - name: Validate and lint the Flatpak
+        if: steps.changes.outputs.flatpak == 'true'
+        run: bash flatpak/ci-check.sh lint
+
+  hosted-csp:
+    # Vast op 24.04: Playwright 1.59 kent het nieuwere ubuntu-latest (26.04) niet.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: open-pdf-studio
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Hosted bundle under a strict CSP
+        run: npm run test:hosted-csp
+
+      - name: Central review dialog lifecycle and access controls
+        run: node scripts/test-central-review-browser.mjs
+
+      - name: Central PDF snapshot and PDF/XFDF export
+        run: node scripts/test-central-review-pdf-browser.mjs
+
+  # De Python-bibliotheek (#518): de gegenereerde laag loopt gelijk met
+  # mcp-stdio/tools.json, de tests (tegen een nep-MCP-server, zonder app) slagen
+  # op elk platform en sdist + wheel bouwen.
+  python-library:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: '3.10' }
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: windows-latest, python: '3.12' }
+          - { os: macos-latest, python: '3.12' }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Generated tool layer is up to date
+        run: node python/scripts/generate-tools.mjs --check
+
+      - name: Test
+        working-directory: python
+        run: python -m unittest discover -s tests -t tests -v
+
+      - name: Install collaboration storage SDK
+        run: python -m pip install -r collaboration-server/requirements.txt
+
+      - name: Collaboration storage and HTTP tests
+        working-directory: collaboration-server
+        run: python -m unittest discover -s tests -v
+
+      - name: Collaboration event compatibility with Tauri
+        run: node collaboration-server/tests/review-compatibility.mjs
+
+      - name: Test production JS clients against SQLite
+        env:
+          PYTHON: python
+        run: node --test open-pdf-studio/js/review/central-review-integration.test.mjs
+
+      - name: Build sdist and wheel
+        shell: bash
+        run: |
+          cp LICENSE.md python/LICENSE.md
+          python -m pip install --upgrade build
+          python -m build python --outdir python/dist
+
+  collaboration-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build collaboration image locally (no publication)
+        run: docker build -t opds-review-test collaboration-server
+      - name: Smoke test production server and persistent volume
+        run: python3 collaboration-server/tests/container_smoke.py opds-review-test
+
+  collaboration-objectstore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: minio/minio
+          ref: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+          path: .ci-minio
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.8'
+          cache-dependency-path: .ci-minio/go.sum
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install collaboration dependencies
+        run: python -m pip install -r collaboration-server/requirements.txt
+      - name: Build pinned objectstore for local tests only
+        env:
+          GOTOOLCHAIN: local
+          GOMAXPROCS: '2'
+        run: go build -C .ci-minio -p 2 -o "$RUNNER_TEMP/opds-minio-test" .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Build production native transport probe
+        run: cargo build --locked --manifest-path open-pdf-studio/scripts/review-native-tests/Cargo.toml
+      - name: Qualify real S3, native transport and joint offline restore
+        run: python collaboration-server/tests/objectstore_integration.py "$RUNNER_TEMP/opds-minio-test" open-pdf-studio/scripts/review-native-tests/target/debug/opds-review-native-tests
+
+
+  collaboration-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Test production central review transport
+        run: cargo test --locked --manifest-path open-pdf-studio/scripts/review-native-tests/Cargo.toml

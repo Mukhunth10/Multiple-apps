@@ -1,0 +1,428 @@
+# Bonsai - OpenBIM Blender Add-on
+# Copyright (C) 2020, 2021 Dion Moult <dion@thinkmoult.com>
+#
+# This file is part of Bonsai.
+#
+# Bonsai is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Bonsai is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Bonsai.  If not, see <http://www.gnu.org/licenses/>.
+
+from math import radians
+from typing import TYPE_CHECKING, Union
+
+import bpy
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
+from bpy.types import PropertyGroup
+
+import bonsai.tool as tool
+from bonsai.bim.module.structural.data import (
+    BoundaryConditionsData,
+    LoadGroupDecorationData,
+    StructuralAnalysisModelsData,
+    StructuralLoadCasesData,
+    StructuralLoadsData,
+)
+from bonsai.bim.prop import Attribute
+
+
+def get_load_groups_to_show(self: "BIMStructuralProperties", context: bpy.types.Context) -> list[tuple[str, str, str]]:
+    if not LoadGroupDecorationData.is_loaded:
+        LoadGroupDecorationData.load()
+    return LoadGroupDecorationData.data["load_groups_to_show"]
+
+
+def update_unused_loads_only(self: "BIMStructuralProperties", context: bpy.types.Context) -> None:
+    bpy.ops.bim.load_structural_loads()
+
+
+def get_buildings(self: "BIMStructuralProperties", context: bpy.types.Context) -> list[tuple[str, str, str]]:
+    if not StructuralAnalysisModelsData.is_loaded:
+        StructuralAnalysisModelsData.load()
+    index = self.active_structural_analysis_model_index
+    if not 0 <= index < len(self.structural_analysis_models):
+        return []
+    model_id = self.structural_analysis_models[index].ifc_definition_id
+    return StructuralAnalysisModelsData.data["unserved_buildings"].get(model_id, [])
+
+
+def update_activity_type(self: "BIMStructuralProperties", context: bpy.types.Context) -> None:
+    LoadGroupDecorationData.is_loaded = False
+
+
+def update_show_loads(self: "BIMStructuralProperties", context: bpy.types.Context) -> None:
+    from bonsai.bim.module.structural.decorator import show_loads
+
+    show_loads(self.show_loads)
+
+
+def update_loads_display(self: "BIMStructuralProperties", context: bpy.types.Context) -> None:
+    from bonsai.bim.module.structural.decorator import LoadsDecorator
+
+    if LoadsDecorator.is_installed:
+        LoadsDecorator.update()
+        tool.Blender.update_all_viewports(context)
+
+
+def get_applicable_structural_load_types(
+    self: "BIMStructuralProperties", context: bpy.types.Context
+) -> list[tuple[str, str, str]]:
+    if not StructuralLoadCasesData.is_loaded:
+        StructuralLoadCasesData.load()
+    # Recomputed on every call so the choices follow the current selection.
+    StructuralLoadCasesData.data["applicable_structural_load_types"] = (
+        StructuralLoadCasesData.applicable_structural_load_types()
+    )
+    return StructuralLoadCasesData.data["applicable_structural_load_types"]
+
+
+def updateApplicableStructuralLoadTypes(self: "BIMStructuralProperties", context: bpy.types.Context) -> None:
+    StructuralLoadCasesData.data["applicable_structural_loads"] = StructuralLoadCasesData.applicable_structural_loads()
+
+
+def get_applicable_structural_loads(
+    self: "BIMStructuralProperties", context: bpy.types.Context
+) -> list[tuple[str, str, str]]:
+    if not StructuralLoadCasesData.is_loaded:
+        StructuralLoadCasesData.load()
+    return StructuralLoadCasesData.data["applicable_structural_loads"]
+
+
+def get_structural_load_types(
+    self: "BIMStructuralProperties", context: bpy.types.Context
+) -> list[tuple[str, str, str]]:
+    if not StructuralLoadsData.is_loaded:
+        StructuralLoadsData.load()
+    return StructuralLoadsData.data["structural_load_types"]
+
+
+def get_boundary_condition_types(
+    self: "BIMStructuralProperties", context: bpy.types.Context
+) -> list[tuple[str, str, str]]:
+    if not BoundaryConditionsData.is_loaded:
+        BoundaryConditionsData.load()
+    return BoundaryConditionsData.data["boundary_condition_types"]
+
+
+def updateAxisAngle(self: "BIMObjectStructuralProperties", context: bpy.types.Context) -> None:
+    if not self.axis_empty:
+        return
+    obj = context.active_object
+    assert obj and isinstance(obj.data, bpy.types.Mesh)
+    empty = self.axis_empty
+    x_axis = obj.data.vertices[1].co - obj.data.vertices[0].co
+    empty.location = obj.data.vertices[0].co
+    empty.rotation_mode = "QUATERNION"
+    empty.rotation_quaternion = x_axis.to_track_quat("X", "Z")
+    empty.rotation_mode = "XYZ"
+    empty.rotation_euler[0] = radians(self.axis_angle)
+
+
+def updateConnectionCS(self: "BIMObjectStructuralProperties", context: bpy.types.Context) -> None:
+    if not self.ccs_empty:
+        return
+    obj = context.active_object
+    assert obj and isinstance(obj.data, bpy.types.Mesh)
+    empty = self.ccs_empty
+    empty.location = obj.data.vertices[0].co
+    empty.rotation_mode = "XYZ"
+    empty.rotation_euler[0] = radians(self.ccs_x_angle)
+    empty.rotation_euler[1] = radians(self.ccs_y_angle)
+    empty.rotation_euler[2] = radians(self.ccs_z_angle)
+
+
+class StructuralAnalysisModel(PropertyGroup):
+    name: StringProperty(name="Name")
+    ifc_definition_id: IntProperty(name="IFC Definition ID")
+
+    if TYPE_CHECKING:
+        ifc_definition_id: int
+
+
+class StructuralActivity(PropertyGroup):
+    name: StringProperty(name="Name")
+    applied_load_class: StringProperty(name="Applied Load Class")
+    ifc_definition_id: IntProperty(name="IFC Definition ID")
+
+    if TYPE_CHECKING:
+        applied_load_class: str
+        ifc_definition_id: int
+
+
+class StructuralLoad(PropertyGroup):
+    name: StringProperty(name="Name")
+    ifc_definition_id: IntProperty(name="IFC Definition ID")
+    number_of_inverse_references: IntProperty(name="Number of Inverse References")
+
+    if TYPE_CHECKING:
+        ifc_definition_id: int
+        number_of_inverse_references: int
+
+
+class BoundaryCondition(PropertyGroup):
+    name: StringProperty(name="Name")
+    ifc_definition_id: IntProperty(name="IFC Definition ID")
+    number_of_inverse_references: IntProperty(name="Number of Inverse References")
+
+    if TYPE_CHECKING:
+        ifc_definition_id: int
+        number_of_inverse_references: int
+
+
+class StructuralLoadCombinationFactor(PropertyGroup):
+    name: StringProperty(name="Name")
+    ifc_definition_id: IntProperty(name="IFC Definition ID")
+    is_included: BoolProperty(name="Included", description="Include this load case in the load combination")
+    factor: FloatProperty(name="Factor", description="The factor this load case is multiplied by", default=1.0)
+
+    if TYPE_CHECKING:
+        ifc_definition_id: int
+        is_included: bool
+        factor: float
+
+
+class BIMStructuralProperties(PropertyGroup):
+    structural_analysis_model_attributes: CollectionProperty(
+        name="Structural Analysis Model Attributes", type=Attribute
+    )
+    is_editing: BoolProperty(name="Is Editing", default=False)
+    structural_analysis_models: CollectionProperty(name="Structural Analysis Models", type=StructuralAnalysisModel)
+    active_structural_analysis_model_index: IntProperty(name="Active Structural Analysis Model Index")
+    active_structural_analysis_model_id: IntProperty(name="Active Structural Analysis Model Id")
+    current_structural_analysis_model_id: IntProperty(name="Current Structural Analysis Model Id")
+    building: EnumProperty(items=get_buildings, name="Building")
+    load_case_attributes: CollectionProperty(name="Load Case Attributes", type=Attribute)
+    load_case_has_self_weight: BoolProperty(name="Include Self-Weight", default=False)
+    load_case_self_weight: FloatVectorProperty(
+        name="Self-Weight Coefficients",
+        size=3,
+        default=(0.0, 0.0, -1.0),
+        description="Self-weight coefficients (X, Y, Z) in the analysis model's axes",
+    )
+    active_load_case_id: IntProperty(name="Active Load Case Id")
+    load_group_editing_type: StringProperty(name="Load Group Editing Type")
+    load_combination_attributes: CollectionProperty(name="Load Combination Attributes", type=Attribute)
+    active_load_combination_id: IntProperty(name="Active Load Combination Id")
+    load_combination_factors: CollectionProperty(name="Load Combination Factors", type=StructuralLoadCombinationFactor)
+    # load_group_attributes: CollectionProperty(name="Load Group Attributes", type=Attribute)
+    active_load_group_id: IntProperty(name="Active Load Group Id")
+    applicable_structural_load_types: EnumProperty(
+        items=get_applicable_structural_load_types,
+        name="Applicable Structural Load Types",
+        update=updateApplicableStructuralLoadTypes,
+    )
+    applicable_structural_loads: EnumProperty(items=get_applicable_structural_loads, name="Applicable Structural Loads")
+    load_group_activities: CollectionProperty(name="Load Group Activities", type=StructuralActivity)
+    active_load_group_activity_index: IntProperty(name="Active Load Group Activity Index")
+
+    structural_loads: CollectionProperty(name="Structural Loads", type=StructuralLoad)
+    active_structural_load_index: IntProperty(name="Active Structural Load Index")
+    active_structural_load_id: IntProperty(name="Active Structural Load Id")
+    is_editing_loads: BoolProperty(name="Is Editing Loads", default=False)
+    structural_load_types: EnumProperty(items=get_structural_load_types, name="Structural Load Types")
+    structural_load_attributes: CollectionProperty(name="Structural Load Attributes", type=Attribute)
+    filtered_structural_loads: BoolProperty(name="Filtered Structural Loads", default=False)
+    show_unused_loads_only: BoolProperty(
+        name="Unused Only",
+        description="Only list load definitions that are not applied in any load case or load group",
+        default=False,
+        update=update_unused_loads_only,
+    )
+
+    boundary_conditions: CollectionProperty(name="Boundary Conditions", type=BoundaryCondition)
+    active_boundary_condition_index: IntProperty(name="Active Boundary Condition Index")
+    active_boundary_condition_id: IntProperty(name="Active Boundary Condition Id")
+    is_editing_boundary_conditions: BoolProperty(name="Is Editing Boundary Conditions", default=False)
+    boundary_condition_types: EnumProperty(items=get_boundary_condition_types, name="Boundary Condition Types")
+    boundary_condition_attributes: CollectionProperty(name="Boundary Condition Attributes", type=Attribute)
+    filtered_boundary_conditions: BoolProperty(name="Filtered Boundary Conditions", default=False)
+
+    show_loads: BoolProperty(
+        name="Structural Loads",
+        description="Show the loads on visible structural items in the viewport. Click a load to edit it",
+        default=False,
+        update=update_show_loads,
+    )
+    update_load_repr: BoolProperty(name="Update Load Representation", default=False)
+    enable_repr_auto_update: BoolProperty(name="Auto Update", default=False)
+    reference_frame: EnumProperty(
+        items=[
+            ("GLOBAL_COORDS", "Global", "Show loads in global reference frame"),
+            ("LOCAL_COORDS", "Local", "Show loads in local reference frame"),
+        ],
+        name="Reference Frame",
+        update=update_loads_display,
+    )
+    activity_type: EnumProperty(
+        items=[
+            ("Action", "Actions", "Show actions loads"),
+            ("External Reaction", "External Reactions", "Show reactions on boundary conditions"),
+            ("Internal Reactions", "Internal Reactions", "Show internal reactions on members"),
+        ],
+        name="Activity Type",
+        update=update_activity_type,
+    )
+    load_group_to_show: EnumProperty(items=get_load_groups_to_show, name="Load Case", update=update_loads_display)
+    force_display: EnumProperty(
+        items=[
+            ("BOTH", "Both", "Show the resultant of point forces with their components"),
+            ("RESULTANT", "Resultant", "Show only the resultant of point forces"),
+            ("COMPONENTS", "Components", "Show only the X, Y and Z components of point forces"),
+            (
+                "PARALLELOGRAM",
+                "Parallelogram",
+                "Show each point force from its point, adding them into their resultant by the parallelogram law",
+            ),
+            (
+                "TIP_TO_TAIL",
+                "Tip-to-Tail",
+                "Show each point force tip to tail, with their resultant closing the chain",
+            ),
+        ],
+        name="Point Forces",
+        default="BOTH",
+        update=update_loads_display,
+    )
+    force_decimals: IntProperty(
+        name="Force Decimals",
+        description="Decimal places of force and moment values shown with loads",
+        default=2,
+        min=0,
+        max=8,
+        update=update_loads_display,
+    )
+    angle_decimals: IntProperty(
+        name="Angle Decimals",
+        description="Decimal places of angles shown with loads",
+        default=2,
+        min=0,
+        max=8,
+        update=update_loads_display,
+    )
+    show_force_angles: BoolProperty(
+        name="Angles",
+        description="Mark the angle of each point force from a horizontal reference axis",
+        default=True,
+        update=update_loads_display,
+    )
+    angle_reference: EnumProperty(
+        items=[
+            (
+                "HORIZONTAL",
+                "Nearest Horizontal",
+                "The acute angle from the nearest horizontal axis, as statics texts draw",
+            ),
+            ("POSITIVE_X", "+X Axis", "The angle counter-clockwise from the +X axis"),
+        ],
+        name="Angle From",
+        default="HORIZONTAL",
+        update=update_loads_display,
+    )
+    force_scale: FloatProperty(
+        name="Force Scale",
+        description="Force per unit length to draw point forces to scale. Zero fits them automatically",
+        min=0,
+        update=update_loads_display,
+    )
+
+    if TYPE_CHECKING:
+        structural_analysis_model_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        is_editing: bool
+        structural_analysis_models: bpy.types.bpy_prop_collection_idprop[StructuralAnalysisModel]
+        active_structural_analysis_model_index: int
+        active_structural_analysis_model_id: int
+        current_structural_analysis_model_id: int
+        building: str
+        load_case_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        load_case_has_self_weight: bool
+        load_case_self_weight: tuple[float, float, float]
+        active_load_case_id: int
+        load_group_editing_type: str
+        load_combination_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        active_load_combination_id: int
+        load_combination_factors: bpy.types.bpy_prop_collection_idprop[StructuralLoadCombinationFactor]
+        active_load_group_id: int
+        applicable_structural_load_types: str
+        applicable_structural_loads: str
+        load_group_activities: bpy.types.bpy_prop_collection_idprop[StructuralActivity]
+        active_load_group_activity_index: int
+
+        structural_loads: bpy.types.bpy_prop_collection_idprop[StructuralLoad]
+        active_structural_load_index: int
+        active_structural_load_id: int
+        is_editing_loads: bool
+        structural_load_types: str
+        structural_load_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        filtered_structural_loads: bool
+        show_unused_loads_only: bool
+
+        boundary_conditions: bpy.types.bpy_prop_collection_idprop[BoundaryCondition]
+        active_boundary_condition_index: int
+        active_boundary_condition_id: int
+        is_editing_boundary_conditions: bool
+        boundary_condition_types: str
+        boundary_condition_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        filtered_boundary_conditions: bool
+
+        show_loads: bool
+        update_load_repr: bool
+        enable_repr_auto_update: bool
+        reference_frame: str
+        activity_type: str
+        load_group_to_show: str
+        force_display: str
+        force_scale: float
+        show_force_angles: bool
+        angle_reference: str
+        force_decimals: int
+        angle_decimals: int
+
+
+class BIMObjectStructuralProperties(PropertyGroup):
+    boundary_condition_attributes: CollectionProperty(name="Boundary Condition Attributes", type=Attribute)
+    active_boundary_condition: IntProperty(name="Active Boundary Condition")
+    active_connects_structural_member: IntProperty(name="Active Connects Structural Member")
+    relating_structural_member: PointerProperty(name="Relating Structural Member", type=bpy.types.Object)
+    is_editing_axis: BoolProperty(name="Is Editing Axis", default=False)
+    axis_angle: FloatProperty(name="Axis Angle", update=updateAxisAngle)
+    axis_empty: PointerProperty(name="Axis Empty", type=bpy.types.Object)
+
+    # relating_structural_activity: PointerProperty(name="Relating Structural Activity", type=bpy.types.Object)
+    is_editing_connection_cs: BoolProperty(name="Is Editing Connection CS", default=False)
+    ccs_x_angle: FloatProperty(name="Connection CS X Angle", update=updateConnectionCS)
+    ccs_y_angle: FloatProperty(name="Connection CS Y Angle", update=updateConnectionCS)
+    ccs_z_angle: FloatProperty(name="Connection CS Z Angle", update=updateConnectionCS)
+    ccs_empty: PointerProperty(name="CCS Empty", type=bpy.types.Object)
+
+    if TYPE_CHECKING:
+        boundary_condition_attributes: bpy.types.bpy_prop_collection_idprop[Attribute]
+        active_boundary_condition: int
+        active_connects_structural_member: int
+        relating_structural_member: Union[bpy.types.Object, None]
+        is_editing_axis: bool
+        axis_angle: float
+        axis_empty: Union[bpy.types.Object, None]
+
+        # relating_structural_activity: Union[bpy.types.Object, None]
+        is_editing_connection_cs: bool
+        ccs_x_angle: float
+        ccs_y_angle: float
+        ccs_z_angle: float
+        ccs_empty: Union[bpy.types.Object, None]
